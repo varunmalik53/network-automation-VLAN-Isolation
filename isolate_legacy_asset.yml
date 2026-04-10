@@ -1,0 +1,76 @@
+---
+- name: Isolate Legacy/Unpatchable Asset
+  hosts: localhost
+  gather_facts: false
+  vars_prompt:
+    - name: ansible_user
+      prompt: "Enter your AD Username"
+      private: false
+    - name: ansible_password
+      prompt: "Enter your AD Password"
+      private: true
+    - name: asset_name
+      prompt: "Enter the hostname of the legacy asset"
+      private: false
+    - name: asset_ip
+      prompt: "Enter the IP address of the legacy asset"
+      private: false
+    - name: switch_hostname
+      prompt: "Enter the switch inventory hostname (e.g., hyd-dist-sw-01)"
+      private: false
+    - name: switch_port
+      prompt: "Enter the switch port (e.g., 1/1/12)"
+      private: false
+    - name: firewall_hostname
+      prompt: "Enter the firewall inventory hostname (e.g., hyd-fw)"
+      private: false
+
+  tasks:
+    - name: "STEP 1A: Discover Current VLAN for the Port"
+      commscope.icx.icx_command:
+        commands: "show interface ethernet {{ switch_port }}"
+      register: port_status
+      delegate_to: "{{ switch_hostname }}"
+
+    - name: "STEP 1B: Remove Port from Old VLAN (Ruckus Quirk)"
+      commscope.icx.icx_config:
+        lines:
+          - "no untagged ethernet {{ switch_port }}"
+        parents: "vlan {{ item }}"
+      loop: "{{ port_status.stdout[0] | regex_findall('Untagged member of L2 VLAN ([0-9]+)') }}"
+      delegate_to: "{{ switch_hostname }}"
+      when: item != "999" and item != "1"
+
+    - name: "STEP 1C: Add Port to Legacy Isolation VLAN (VLAN 999)"
+      commscope.icx.icx_config:
+        lines:
+          - "untagged ethernet {{ switch_port }}"
+        parents: "vlan 999"
+        save_when: modified
+      delegate_to: "{{ switch_hostname }}"
+
+    - name: "STEP 2: Create Firewall Address Object on FortiGate"
+      fortinet.fortios.fortios_firewall_address:
+        vdom: "root"
+        state: "present"
+        firewall_address:
+          name: "LEGACY-{{ asset_name }}"
+          type: "ipmask"
+          subnet: "{{ asset_ip }} 255.255.255.255"
+          comment: "Isolated per ITINFRA-6066 SOP"
+          color: 6
+      delegate_to: "{{ firewall_hostname }}"
+
+    - name: "STEP 3: Add Asset to the Restricted Legacy Address Group"
+      fortinet.fortios.fortios_firewall_addrgrp:
+        vdom: "root"
+        state: "present"
+        firewall_addrgrp:
+          name: "GRP-LEGACY-ASSETS"
+          member:
+            - name: "LEGACY-{{ asset_name }}"
+      delegate_to: "{{ firewall_hostname }}"
+
+    - name: "STEP 4: Output Verification"
+      debug:
+        msg: "SUCCESS: {{ asset_name }} ({{ asset_ip }}) has been isolated to VLAN 999 on {{ switch_hostname }} port {{ switch_port }}."
